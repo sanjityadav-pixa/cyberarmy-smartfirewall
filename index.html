@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enterprise Cyber-SOC Dashboard | Smart Firewall</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { 
+      background-color: #070b14; 
+      color: #f8fafc; 
+      font-family: 'Consolas', 'Courier New', monospace; 
+    }
+    .glass-panel { 
+      background: #0d1527; 
+      border: 1px solid #1e293b;
+    }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-6 relative select-none">
+
+  <!-- Header -->
+  <header class="flex flex-wrap justify-between items-center pb-4 mb-6 border-b-2 border-slate-800">
+    <div class="flex items-center space-x-3">
+      <div class="w-5 h-5 rounded-full bg-emerald-400 animate-ping"></div>
+      <div>
+        <h1 class="text-3xl font-black tracking-widest text-emerald-400 drop-shadow-[0_0_12px_rgba(52,211,153,0.5)]">AEGIS // ZERO-TRUST DEFENSE WAF</h1>
+        <p class="text-sm font-bold text-slate-300 uppercase tracking-wider mt-0.5">Autonomous Behavioral Threat Scoring & Active Honeypot Grid</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-4">
+      <span id="ws-status" class="px-4 py-1.5 text-xs font-black rounded-full border border-emerald-500 bg-emerald-950/70 text-emerald-300 tracking-wider shadow-[0_0_10px_rgba(16,185,129,0.3)]">
+        ● WEBSOCKETS ONLINE
+      </span>
+      <span class="text-sm text-slate-300 font-bold font-mono" id="clock">00:00:00 UTC</span>
+    </div>
+  </header>
+
+  <!-- Top Metrics Bar -->
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    <div class="glass-panel p-5 rounded-xl border-2 border-emerald-500/80 bg-emerald-950/20 shadow-[0_0_18px_rgba(16,185,129,0.15)]">
+      <p class="text-sm uppercase text-emerald-400 font-black tracking-wider">TOTAL INBOUND STREAMS</p>
+      <h2 id="total-reqs" class="text-5xl font-black text-emerald-300 mt-2 tracking-tight">0</h2>
+    </div>
+
+    <div class="glass-panel p-5 rounded-xl border-2 border-red-500 bg-red-950/40 shadow-[0_0_22px_rgba(239,68,68,0.35)]">
+      <p class="text-sm uppercase text-red-300 font-black tracking-wider">THREATS INTERCEPTED</p>
+      <h2 id="blocked-reqs" class="text-5xl font-black text-red-400 mt-2 tracking-tight drop-shadow-[0_0_10px_rgba(248,113,113,0.5)]">0</h2>
+    </div>
+
+    <div class="glass-panel p-5 rounded-xl border-2 border-amber-400 bg-amber-950/40 shadow-[0_0_22px_rgba(251,191,36,0.3)]">
+      <p class="text-sm uppercase text-amber-300 font-black tracking-wider">QUARANTINED ACTORS</p>
+      <h2 id="quarantine-count" class="text-5xl font-black text-amber-300 mt-2 tracking-tight drop-shadow-[0_0_10px_rgba(252,211,77,0.5)]">0</h2>
+    </div>
+
+    <div class="glass-panel p-5 rounded-xl border-2 border-indigo-500 bg-indigo-950/30 shadow-[0_0_18px_rgba(99,102,241,0.2)]">
+      <p class="text-sm uppercase text-indigo-300 font-black tracking-wider">ACTIVE HONEYPOT NODES</p>
+      <h2 class="text-5xl font-black text-indigo-400 mt-2 tracking-tight">ACTIVE</h2>
+    </div>
+  </div>
+
+  <!-- Live Traffic Analytics Chart -->
+  <div class="glass-panel p-5 rounded-xl mb-6 border-2 border-slate-800">
+    <div class="flex justify-between items-center mb-3">
+      <h3 class="text-sm font-black uppercase tracking-wider text-slate-200">LIVE TRAFFIC TELEMETRY (ALLOWED VS ATTACKS)</h3>
+      <span class="text-xs text-slate-400 font-bold font-mono">1.0s Window Tick</span>
+    </div>
+    <div class="h-44 w-full">
+      <canvas id="trafficChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Main Grids: Telemetry Stream & Quarantined -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="lg:col-span-2 glass-panel p-5 rounded-xl border-2 border-slate-800">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="text-base font-black uppercase tracking-wider text-emerald-400">REAL-TIME THREAT & INGRESS STREAM</h3>
+        <span class="text-xs text-slate-400 font-bold tracking-wide">{Click any event to inspect headers}</span>
+      </div>
+      <div id="incident-stream" class="space-y-3 h-[450px] overflow-y-auto pr-2">
+        <p class="text-sm text-slate-400 italic">Listening for network telemetry...</p>
+      </div>
+    </div>
+
+    <div class="glass-panel p-5 rounded-xl border-2 border-red-950 bg-red-950/10">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="text-base font-black uppercase tracking-wider text-red-400">QUARANTINED ATTACKERS</h3>
+        <span class="text-xs text-slate-400 font-bold">Isolated at Layer 7</span>
+      </div>
+      <div id="quarantine-list" class="space-y-3 h-[450px] overflow-y-auto pr-2">
+        <p class="text-sm text-slate-500 italic">Zero active quarantined endpoints.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide-Over Packet Inspector Modal -->
+  <div id="inspector-modal" class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 hidden flex justify-end">
+    <div class="w-full max-w-lg h-full bg-slate-900 border-l-2 border-slate-700 p-6 flex flex-col justify-between shadow-2xl">
+      <div>
+        <div class="flex justify-between items-center border-b-2 border-slate-800 pb-3 mb-5">
+          <h2 class="text-xl font-black text-emerald-400">RAW PACKET INSPECTOR</h2>
+          <button onclick="closeInspector()" class="text-slate-400 hover:text-white text-2xl font-black">✕</button>
+        </div>
+        <div class="space-y-4 text-sm font-mono">
+          <div>
+            <p class="text-slate-400 uppercase font-bold text-xs">Actor IP & Origin</p>
+            <p id="inspect-ip" class="text-slate-100 font-black text-base mt-0.5"></p>
+          </div>
+          <div>
+            <p class="text-slate-400 uppercase font-bold text-xs">Endpoint Requested</p>
+            <p id="inspect-path" class="text-amber-300 font-bold break-all mt-0.5"></p>
+          </div>
+          <div>
+            <p class="text-slate-400 uppercase font-bold text-xs">Detection Classification</p>
+            <p id="inspect-reason" class="text-red-400 font-black text-base mt-0.5"></p>
+          </div>
+          <div>
+            <p class="text-slate-400 uppercase font-bold text-xs">Computed Threat Score</p>
+            <p id="inspect-score" class="text-slate-100 font-black text-base mt-0.5"></p>
+          </div>
+          <div class="pt-2">
+            <p class="text-slate-400 uppercase font-bold text-xs mb-1">Simulated Packet Headers</p>
+            <pre id="inspect-headers" class="bg-black/90 p-4 rounded-lg text-xs text-slate-300 border border-slate-800 overflow-x-auto leading-relaxed"></pre>
+          </div>
+        </div>
+      </div>
+      <button onclick="closeInspector()" class="w-full py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg font-black text-sm uppercase tracking-wider transition">
+        Close Inspector
+      </button>
+    </div>
+  </div>
+
+  <script>
+    setInterval(() => {
+      document.getElementById('clock').innerText = new Date().toTimeString().split(' ')[0] + ' LOCAL';
+    }, 1000);
+
+    // XSS Fix: Browser me tags execute hone se roknay ke liye HTML escape function
+    function escapeHTML(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    const ctx = document.getElementById('trafficChart').getContext('2d');
+    const chartData = {
+      labels: Array(15).fill(''),
+      datasets: [
+        {
+          label: 'Allowed Traffic',
+          borderColor: '#10b981',
+          backgroundColor: 'rgba(16, 185, 129, 0.25)',
+          data: Array(15).fill(0),
+          fill: true,
+          tension: 0.35,
+          borderWidth: 3
+        },
+        {
+          label: 'Blocked Threats',
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239, 68, 68, 0.35)',
+          data: Array(15).fill(0),
+          fill: true,
+          tension: 0.35,
+          borderWidth: 3
+        }
+      ]
+    };
+
+    const trafficChart = new Chart(ctx, {
+      type: 'line',
+      data: chartData,
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: {
+            labels: { color: '#e2e8f0', font: { family: 'Consolas', size: 12, weight: 'bold' } }
+          }
+        },
+        scales: {
+          x: { grid: { color: '#1e293b' }, ticks: { display: false } },
+          y: { grid: { color: '#1e293b' }, ticks: { color: '#cbd5e1', precision: 0, font: { weight: 'bold' } }, beginAtZero: true }
+        }
+      }
+    });
+
+    let currentAllowedCount = 0;
+    let currentBlockedCount = 0;
+
+    setInterval(() => {
+      trafficChart.data.datasets[0].data.shift();
+      trafficChart.data.datasets[0].data.push(currentAllowedCount);
+      trafficChart.data.datasets[1].data.shift();
+      trafficChart.data.datasets[1].data.push(currentBlockedCount);
+      trafficChart.update();
+      currentAllowedCount = 0;
+      currentBlockedCount = 0;
+    }, 1000);
+
+    let totalReqs = 0;
+    let blockedReqs = 0;
+    const quarantinedSet = new Set();
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProto}//${window.location.host}/ws`);
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.action === 'UNQUARANTINE') {
+          quarantinedSet.delete(data.client_ip);
+          document.getElementById('quarantine-count').innerText = quarantinedSet.size;
+          updateQuarantinePanel();
+          return;
+        }
+        
+
+        totalReqs++;
+        document.getElementById('total-reqs').innerText = totalReqs;
+
+        const isBlocked = (data.status === 'BLOCKED' || data.action === 'BLOCK' || (data.score >= 50));
+
+        if (isBlocked) {
+          blockedReqs++;
+          currentBlockedCount++;
+          document.getElementById('blocked-reqs').innerText = blockedReqs;
+          if (data.client_ip) quarantinedSet.add(data.client_ip);
+        } else {
+          currentAllowedCount++;
+        }
+
+        document.getElementById('quarantine-count').innerText = quarantinedSet.size;
+        addIncidentStream(data, isBlocked);
+        updateQuarantinePanel();
+      } catch (err) {
+        console.error("Telemetry parse error:", err);
+      }
+    };
+
+    function addIncidentStream(data, isBlocked) {
+      const container = document.getElementById('incident-stream');
+      const card = document.createElement('div');
+      
+      card.className = `p-3.5 rounded-lg border-2 cursor-pointer transition transform hover:scale-[1.01] ${
+        isBlocked 
+          ? 'bg-gradient-to-r from-red-950/80 to-red-900/40 border-red-600 shadow-[0_0_15px_rgba(220,38,38,0.25)]' 
+          : 'bg-slate-900/80 border-emerald-900/60 hover:border-emerald-500'
+      }`;
+
+      card.onclick = () => openInspector(data);
+
+      const time = new Date().toTimeString().split(' ')[0];
+      const clientIp = escapeHTML(data.client_ip || data.ip || '127.0.0.1');
+      const score = data.score !== undefined ? data.score : (data.threat_score || 0);
+      const displayStatus = isBlocked ? 'BLOCKED' : 'ALLOWED';
+      const path = escapeHTML(data.path || data.endpoint || '/');
+      const reason = escapeHTML(data.reason || 'Verified Clean Traffic');
+
+      card.innerHTML = `
+        <div class="flex justify-between items-center mb-1.5">
+          <div class="flex items-center space-x-2.5">
+            <span class="text-slate-400 font-bold text-xs">[${time}]</span>
+            <span class="px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-200 font-black border border-slate-700">${escapeHTML(data.country || 'IN')} LOCAL/INT</span>
+            <span class="font-black text-slate-100 text-sm tracking-wide">${clientIp}</span>
+            <span class="text-xs px-2 py-0.5 rounded font-black ${score >= 50 ? 'bg-red-500 text-white shadow-[0_0_8px_rgba(239,68,68,0.6)]' : 'bg-emerald-600/30 text-emerald-300'}">RISK: ${score}/100</span>
+          </div>
+          <span class="font-black text-sm tracking-widest ${isBlocked ? 'text-red-400 drop-shadow-[0_0_8px_rgba(248,113,113,0.8)]' : 'text-emerald-400'}">${displayStatus}</span>
+        </div>
+        <div class="text-xs font-bold text-slate-300 flex justify-between items-center mt-1">
+          <span>${escapeHTML(data.method || 'GET')} <span class="text-amber-300 font-mono font-bold">${path}</span> <span class="text-slate-400">→</span> <span class="${isBlocked ? 'text-red-300 font-black' : 'text-emerald-300'}">${reason}</span></span>
+          <span class="text-xs text-slate-400 font-normal">🔍 Click to inspect</span>
+        </div>
+      `;
+
+      if (container.children[0]?.tagName === 'P') container.innerHTML = '';
+      container.prepend(card);
+      if (container.children.length > 40) container.removeChild(container.lastChild);
+    }
+
+    function updateQuarantinePanel() {
+  const qList = document.getElementById('quarantine-list');
+  if (quarantinedSet.size === 0) {
+    qList.innerHTML = '<p class="text-sm text-slate-500 italic">Zero active quarantined endpoints.</p>';
+    return;
+  }
+  qList.innerHTML = '';
+  quarantinedSet.forEach(ip => {
+    const item = document.createElement('div');
+    item.className = 'p-3 rounded-lg bg-red-950/70 border-2 border-red-600 shadow-[0_0_12px_rgba(220,38,38,0.3)] flex justify-between items-center';
+    item.innerHTML = `
+      <div>
+        <p class="font-black text-red-300 text-sm tracking-wide">${escapeHTML(ip)}</p>
+        <p class="text-xs font-bold text-slate-300">Status: Quarantine Enforced</p>
+      </div>
+      <div class="flex items-center space-x-2">
+        <span class="px-2 py-1 rounded bg-red-600 text-white text-xs font-black uppercase">LOCKED</span>
+        <button onclick="releaseIP('${escapeHTML(ip)}')" class="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black uppercase transition">
+          UNLOCK
+        </button>
+      </div>
+    `;
+    qList.appendChild(item);
+  });
+}
+
+async function releaseIP(ip) {
+  await fetch('/api/unquarantine', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ip: ip })
+  });
+}
+    function openInspector(data) {
+      document.getElementById('inspect-ip').innerText = `${data.client_ip || data.ip} (${data.country || 'IN'} LOCAL/INT)`;
+      document.getElementById('inspect-path').innerText = `${data.method || 'GET'} ${data.path || '/'}`;
+      document.getElementById('inspect-reason').innerText = data.reason || 'Traffic Verified - Normal Flow';
+      document.getElementById('inspect-score').innerText = `${data.score !== undefined ? data.score : 0} / 100`;
+
+      const headers = {
+        "Host": window.location.host,
+        "User-Agent": "SecProbe-Testing-Client / HTTP Engine",
+        "X-Forwarded-For": data.client_ip || data.ip,
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Defense-Action": (data.status === 'BLOCKED' || data.score >= 50) ? 'DROP_AND_ISOLATE' : 'FORWARD_UPSTREAM'
+      };
+      document.getElementById('inspect-headers').innerText = JSON.stringify(headers, null, 2);
+      document.getElementById('inspector-modal').classList.remove('hidden');
+    }
+
+    function closeInspector() {
+      document.getElementById('inspector-modal').classList.add('hidden');
+    }
+  </script>
+</body>
+</html>
