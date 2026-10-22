@@ -1,83 +1,117 @@
 import time
 import re
-from typing import List, Dict
-from urllib.parse import unquote_plus, unquote
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+import json
+import sqlite3
+from typing import List, Dict, Optional
+from urllib.parse import unquote, unquote_plus
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import httpx
 import uvicorn
 
-app = FastAPI(title="Smart Reverse Proxy Firewall Engine")
+app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-# ==========================================
-# CONFIGURATION & STATE
-# ==========================================
 BACKEND_URL = "http://127.0.0.1:9000"
+DB_FILE = "aegis_soc.db"
+START_TIME = time.time()
 
 ACTORS: Dict[str, Dict] = {}
 active_connections: List[WebSocket] = []
+DENYLIST: set = set()
+ALLOWLIST: set = set()
 
-SQLI_PATTERNS = [
-    r"(\bOR\b|\bAND\b)\s+['\"].*?['\"]?\s*=\s*['\"]?.*?",
-    r"--",
-    r"/\*.*?\*/",
-    r"\bUNION\b\s+\bSELECT\b",
-    r"\bSELECT\b.*?\bFROM\b",
-    r"\bDROP\b\s+\bTABLE\b",
-    r"1=1"
+HONEYPOT_NODES = [
+    {"id": "node-1", "name": "Fake Admin Portal", "path": "/admin", "type": "Web Decoy", "status": "ACTIVE", "hits": 0},
+    {"id": "node-2", "name": "WordPress Trap", "path": "/wp-login.php", "type": "CMS Decoy", "status": "ACTIVE", "hits": 0},
+    {"id": "node-3", "name": "DB Manager Trap", "path": "/phpmyadmin", "type": "Database Decoy", "status": "ACTIVE", "hits": 0},
+    {"id": "node-4", "name": "Secret Env Trap", "path": "/.env", "type": "Credential Decoy", "status": "ACTIVE", "hits": 0},
+    {"id": "node-5", "name": "Config Trap", "path": "/config.json", "type": "Configuration Decoy", "status": "ACTIVE", "hits": 0}
 ]
 
-# Bullet-proof XSS Signatures
-XSS_PATTERNS = [
-    r"<script",
-    r"javascript:",
-    r"onerror",
-    r"oneerror",               # Typo bypass fix
-    r"onload",
-    r"alert\s*\(",             # Direct alert('XSS') match
-    r"<img\b",                 # Direct match for ANY <img tag regardless of attributes
-    r"<svg\b",
-    r"<iframe\b",
-    r"<body\b"
-]
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS security_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT, client_ip TEXT, method TEXT, path TEXT,
+        status TEXT, score INTEGER, severity TEXT, category TEXT, reason TEXT, is_demo INTEGER DEFAULT 0
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT, operator TEXT, action TEXT, target TEXT, outcome TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS waf_rules (
+        id TEXT PRIMARY KEY, name TEXT, category TEXT, severity TEXT, pattern TEXT, description TEXT, enabled INTEGER DEFAULT 1
+    )
+    """)
+    cursor.execute("SELECT COUNT(*) FROM waf_rules")
+    if cursor.fetchone()[0] == 0:
+        default_rules = [
+            ("RULE-SQLI-01", "Classic SQLi Detection", "SQL Injection", "HIGH", r"(\bOR\b|\bAND\b)\s+['\"].*?['\"]?\s*=\s*['\"]?.*?|--|1=1|\bUNION\b\s+\bSELECT\b", "Blocks SQL injection patterns", 1),
+            ("RULE-XSS-01", "Cross-Site Scripting Filter", "XSS", "HIGH", r"<script.*?>.*?</script.*?>|onerror\s*=|onload\s*=|alert\s*\(|<img\b[^>]*>|<svg\b[^>]*>", "Detects script tags and event handlers", 1),
+            ("RULE-TRAV-01", "Path Traversal Detection", "Path Traversal", "HIGH", r"(\.\./|\.\.\\|etc/passwd|windows/win.ini)", "Prevents directory escaping", 1),
+            ("RULE-METH-01", "Suspicious HTTP Method", "Method Policy", "MEDIUM", r"^(TRACK|TRACE|DEBUG)$", "Restricts unsafe HTTP verbs", 1)
+        ]
+        cursor.executemany("INSERT INTO waf_rules VALUES (?, ?, ?, ?, ?, ?, ?)", default_rules)
+    conn.commit()
+    conn.close()
 
-HONEYPOT_PATHS = [
-    "/admin",
-    "/wp-login.php",
-    "/phpmyadmin",
-    "/setup.php",
-    "/.env",
-    "/config.json"
-]
+init_db()
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
 def get_actor_state(ip: str) -> Dict:
     now = time.time()
     if ip not in ACTORS:
-        ACTORS[ip] = {
-            "score": 0,
-            "timestamps": [],
-            "quarantined": False
-        }
+        ACTORS[ip] = {"score": 0, "timestamps": [], "quarantined": False, "reason": "Clean"}
     ACTORS[ip]["timestamps"] = [t for t in ACTORS[ip]["timestamps"] if now - t < 10.0]
     return ACTORS[ip]
 
+def log_audit(operator: str, action: str, target: str, outcome: str):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO audit_logs (timestamp, operator, action, target, outcome) VALUES (datetime('now', 'localtime'), ?, ?, ?, ?)", (operator, action, target, outcome))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def log_event(client_ip: str, method: str, path: str, status: str, score: int, severity: str, category: str, reason: str, is_demo: int = 0):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO security_events (timestamp, client_ip, method, path, status, score, severity, category, reason, is_demo)
+        VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (client_ip, method, path, status, score, severity, category, reason, is_demo))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def get_active_rules():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, category, severity, pattern, enabled FROM waf_rules WHERE enabled = 1")
+    rules = cursor.fetchall()
+    conn.close()
+    return rules
+
 async def broadcast_telemetry(payload: dict):
-    dead_connections = []
+    dead = []
     for ws in active_connections:
         try:
             await ws.send_json(payload)
         except Exception:
-            dead_connections.append(ws)
-    for dc in dead_connections:
-        if dc in active_connections:
-            active_connections.remove(dc)
+            dead.append(ws)
+    for d in dead:
+        if d in active_connections:
+            active_connections.remove(d)
 
-# ==========================================
-# WEBSOCKET & DASHBOARD ENDPOINTS
-# ==========================================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -97,27 +131,146 @@ async def serve_dashboard():
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error loading index.html: {str(e)}</h3>", status_code=500)
 
-# --- YAHAN PASTE KAREIN (A wala code) ---
-@app.post("/api/unquarantine")
-async def unquarantine_ip(data: dict):
-    target_ip = data.get("ip")
-    if target_ip in quarantined_ips:
-        quarantined_ips.remove(target_ip)
-    if target_ip in attacker_scores:
-        attacker_scores[target_ip] = 0
-    await manager.broadcast({
-        "action": "UNQUARANTINE",
-        "client_ip": target_ip
-    })
-    return {"status": "success", "message": f"{target_ip} has been released"}
+# INTERNAL API ROUTES
+@app.post("/api/unban")
+def unban_ip(payload: Dict[str, str]):
+    ip = payload.get("ip")
+    if ip and ip in ACTORS:
+        ACTORS[ip]["quarantined"] = False
+        ACTORS[ip]["score"] = 0
+        ACTORS[ip]["timestamps"] = []
+    if ip and ip in DENYLIST:
+        DENYLIST.remove(ip)
+    log_audit("Admin", "RELEASE_QUARANTINE", ip, "SUCCESS")
+    return {"status": "unbanned", "ip": ip}
 
-# ==========================================
-# L7 FIREWALL MIDDLEWARE
-# ==========================================
+@app.post("/api/quarantine/reset-all")
+def reset_all_quarantine():
+    ACTORS.clear()
+    DENYLIST.clear()
+    log_audit("Admin", "RESET_ALL_QUARANTINES", "ALL_ACTORS", "SUCCESS")
+    return {"status": "cleared"}
+
+@app.get("/api/system/health")
+def get_system_health():
+    uptime_sec = int(time.time() - START_TIME)
+    return {
+        "status": "HEALTHY",
+        "uptime": f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s",
+        "database": "SQLite (Connected)",
+        "active_ws_clients": len(active_connections),
+        "upstream_backend": BACKEND_URL,
+        "protected_mode": "Zero-Trust Active Enforcement"
+    }
+
+@app.get("/api/quarantined")
+def get_quarantined_actors():
+    result = []
+    for ip, data in ACTORS.items():
+        if data.get("quarantined") or data.get("score", 0) >= 100 or ip in DENYLIST:
+            result.append({"ip": ip, "score": data.get("score", 100), "reason": data.get("reason", "Suspicious Activity"), "status": "QUARANTINED"})
+    return result
+
+@app.get("/api/honeypot/nodes")
+def get_honeypots():
+    return HONEYPOT_NODES
+
+@app.post("/api/honeypot/toggle")
+def toggle_honeypot(payload: Dict[str, str]):
+    node_id = payload.get("id")
+    for node in HONEYPOT_NODES:
+        if node["id"] == node_id:
+            node["status"] = "INACTIVE" if node["status"] == "ACTIVE" else "ACTIVE"
+            return {"status": "success", "node": node}
+    raise HTTPException(status_code=404, detail="Honeypot not found")
+
+@app.get("/api/rules")
+def get_rules():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, category, severity, pattern, description, enabled FROM waf_rules")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "name": r[1], "category": r[2], "severity": r[3], "pattern": r[4], "description": r[5], "enabled": bool(r[6])} for r in rows]
+
+@app.post("/api/rules/toggle")
+def toggle_rule(payload: Dict[str, str]):
+    rule_id = payload.get("id")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT enabled FROM waf_rules WHERE id = ?", (rule_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Rule not found")
+    new_state = 0 if row[0] == 1 else 1
+    cursor.execute("UPDATE waf_rules SET enabled = ? WHERE id = ?", (new_state, rule_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "id": rule_id, "enabled": bool(new_state)}
+
+@app.post("/api/rules/test")
+def test_rule_sandbox(payload: Dict[str, str]):
+    test_input = unquote_plus(unquote(payload.get("input", "")))
+    for r_id, name, cat, sev, pattern, _ in get_active_rules():
+        if re.search(pattern, test_input, re.IGNORECASE):
+            return {"verdict": "BLOCKED", "rule_name": name, "category": cat, "severity": sev, "explain": f"Pattern matched regex: {pattern}"}
+    return {"verdict": "ALLOWED", "explain": "Payload passed through cleanly."}
+
+@app.get("/api/ip/reputation")
+def get_ip_reputation(ip: str):
+    actor = ACTORS.get(ip, {"score": 0, "timestamps": [], "quarantined": False, "reason": "No prior records"})
+    cat = "CRITICAL / BOTNET" if actor["score"] >= 80 or ip in DENYLIST else ("SUSPICIOUS" if actor["score"] >= 40 else "CLEAN")
+    return {"ip": ip, "score": actor["score"], "threat_category": cat, "is_denylisted": ip in DENYLIST, "is_allowlisted": ip in ALLOWLIST, "reputation_source": "Autonomous AEGIS L7 Behavioral Matrix"}
+
+@app.get("/api/audit/logs")
+def get_audit_logs():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, operator, action, target, outcome FROM audit_logs ORDER BY id DESC LIMIT 50")
+    logs = cursor.fetchall()
+    conn.close()
+    return [{"timestamp": l[0], "operator": l[1], "action": l[2], "target": l[3], "outcome": l[4]} for l in logs]
+
+@app.get("/api/analytics/events")
+def get_analytics_events():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, client_ip, method, path, status, score, severity, category, reason, is_demo FROM security_events ORDER BY id DESC LIMIT 100")
+    events = cursor.fetchall()
+    conn.close()
+    return [{"timestamp": e[0], "ip": e[1], "method": e[2], "path": e[3], "status": e[4], "score": e[5], "severity": e[6], "category": e[7], "reason": e[8], "is_demo": bool(e[9])} for e in events]
+
+@app.post("/api/demo/inject")
+async def inject_demo_event(payload: Dict[str, str]):
+    etype = payload.get("type", "SQLI")
+    demo_ip = payload.get("ip", "198.51.100.42")
+    if etype == "SQLI":
+        score, sev, cat, rsn, stat = 85, "CRITICAL", "SQL Injection", "Simulated SQL Injection Attack", "BLOCKED"
+    elif etype == "XSS":
+        score, sev, cat, rsn, stat = 65, "HIGH", "XSS", "Simulated XSS Vector", "BLOCKED"
+    elif etype == "HONEYPOT":
+        score, sev, cat, rsn, stat = 100, "CRITICAL", "Honeypot Decoy", "Simulated Hit on Decoy", "BLOCKED"
+    else:
+        score, sev, cat, rsn, stat = 0, "LOW", "Clean Traffic", "Legitimate Authorized Access", "ALLOWED"
+
+    log_event(demo_ip, "POST" if stat == "BLOCKED" else "GET", "/api/test", stat, score, sev, cat, rsn, is_demo=1)
+    event = {"client_ip": demo_ip, "method": "POST" if stat == "BLOCKED" else "GET", "path": "/api/test", "status": stat, "score": score, "severity": sev, "category": cat, "reason": f"[DEMO] {rsn}", "is_demo": True}
+    await broadcast_telemetry(event)
+    return {"status": "injected", "event": event}
+
+# WAF REVERSE PROXY MIDDLEWARE
+INTERNAL_ENDPOINTS = [
+    "/ws", "/dashboard", "/favicon.ico",
+    "/api/unban", "/api/quarantine", "/api/system/health",
+    "/api/quarantined", "/api/honeypot", "/api/rules",
+    "/api/ip/reputation", "/api/audit/logs", "/api/analytics/events", "/api/demo/inject"
+]
+
 @app.middleware("http")
 async def firewall_middleware(request: Request, call_next):
-    # 1. Dashboard, WebSocket bypass
-    if request.url.path in ["/ws", "/dashboard", "/favicon.ico"]:
+    req_path = request.url.path
+    if any(req_path == ep or req_path.startswith(ep + "/") for ep in INTERNAL_ENDPOINTS):
         return await call_next(request)
 
     client_ip = request.client.host if request.client else "127.0.0.1"
@@ -125,173 +278,86 @@ async def firewall_middleware(request: Request, call_next):
     now = time.time()
     actor["timestamps"].append(now)
 
-    req_path = request.url.path
     query_str = str(request.url.query)
-    raw_query = request.scope.get("query_string", b"").decode("utf-8", errors="ignore")
     method = request.method
+    raw_string = f"{req_path} {query_str}"
+    test_string = unquote_plus(unquote(raw_string))
 
-    country_badge = "IN"
-    network_origin = "LOCAL/INT"
+    # Allowlist check
+    if client_ip in ALLOWLIST:
+        return await forward_to_backend(request)
 
-    # 2. Check if already quarantined
-    if actor["quarantined"] or actor["score"] >= 100:
+    # Quarantined Check
+    if client_ip in DENYLIST or actor["quarantined"] or actor["score"] >= 100:
         actor["quarantined"] = True
-        event = {
-            "client_ip": client_ip,
-            "country": country_badge,
-            "origin": network_origin,
-            "method": method,
-            "path": req_path,
-            "status": "BLOCKED",
-            "score": actor["score"],
-            "reason": "Host Quarantined (Score >= 100)"
-        }
+        log_event(client_ip, method, req_path, "BLOCKED", actor["score"], "CRITICAL", "Quarantine", "Endpoint Quarantined")
+        event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": "CRITICAL", "category": "Quarantine", "reason": "Host Quarantined"}
         await broadcast_telemetry(event)
-        return JSONResponse(
-            status_code=403,
-            content={"error": "Access Denied by WAF: Endpoint Quarantined", "ip": client_ip, "score": actor["score"]}
-        )
+        return JSONResponse(status_code=403, content={"error": "Access Denied: Host Quarantined", "ip": client_ip, "score": actor["score"]})
 
-    # 3. Honeypot Path Inspection
-    for trap in HONEYPOT_PATHS:
-        if req_path.lower() == trap.lower() or req_path.lower().startswith(trap.lower()):
+    # Honeypot Check
+    for node in HONEYPOT_NODES:
+        if node["status"] == "ACTIVE" and (req_path.lower() == node["path"].lower() or req_path.lower().startswith(node["path"].lower())):
+            node["hits"] += 1
             actor["score"] = 100
             actor["quarantined"] = True
-            event = {
-                "client_ip": client_ip,
-                "country": country_badge,
-                "origin": network_origin,
-                "method": method,
-                "path": req_path,
-                "status": "BLOCKED",
-                "score": 100,
-                "reason": f"Honeypot Trap Triggered ({trap})"
-            }
+            actor["reason"] = f"Triggered Honeypot: {node['name']}"
+            DENYLIST.add(client_ip)
+            log_event(client_ip, method, req_path, "BLOCKED", 100, "CRITICAL", "Honeypot Trap", actor["reason"])
+            event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": 100, "severity": "CRITICAL", "category": "Honeypot Decoy", "reason": actor["reason"]}
             await broadcast_telemetry(event)
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Critical Intrusion Detected: Honeypot Triggered", "ip": client_ip, "score": 100}
-            )
+            return JSONResponse(status_code=403, content={"error": "Critical Intrusion Detected: Honeypot Triggered", "ip": client_ip, "score": 100})
 
-    # 4. Layer 7 Signature Inspection with Multi-stage Decoding
-    # Normal and plus-decoded inspection string
-    combined_raw = f"{req_path} {query_str} {raw_query}"
-    decoded_string = unquote_plus(unquote(combined_raw))
-
-    # Debug print console par dekhne ke liye
-    print(f"\n[INSPECTING] Raw: {combined_raw}")
-    print(f"[INSPECTING] Decoded: {decoded_string}\n")
-
-    # SQL Injection Check
-    for pattern in SQLI_PATTERNS:
-        if re.search(pattern, decoded_string, re.IGNORECASE) or re.search(pattern, combined_raw, re.IGNORECASE):
-            actor["score"] = min(100, actor["score"] + 45)
+    # L7 Rules Inspection
+    for r_id, name, category, severity, pattern, _ in get_active_rules():
+        if re.search(pattern, test_string, re.IGNORECASE):
+            added_score = 45 if severity == "HIGH" else 25
+            actor["score"] = min(100, actor["score"] + added_score)
             if actor["score"] >= 100:
                 actor["quarantined"] = True
-
-            event = {
-                "client_ip": client_ip,
-                "country": country_badge,
-                "origin": network_origin,
-                "method": method,
-                "path": req_path,
-                "status": "BLOCKED",
-                "score": actor["score"],
-                "reason": "SQL Injection Signature Detected"
-            }
+                DENYLIST.add(client_ip)
+            actor["reason"] = f"Triggered {name}"
+            log_event(client_ip, method, req_path, "BLOCKED", actor["score"], severity, category, actor["reason"])
+            event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": severity, "category": category, "reason": actor["reason"]}
             await broadcast_telemetry(event)
-            return JSONResponse(
-                status_code=403,
-                content={"error": "L7 WAF: SQL Injection Intercepted", "score": actor["score"]}
-            )
+            return JSONResponse(status_code=403, content={"error": f"L7 WAF: {name} Intercepted", "score": actor["score"]})
 
-    # XSS Check
-    for pattern in XSS_PATTERNS:
-        if re.search(pattern, decoded_string, re.IGNORECASE) or re.search(pattern, combined_raw, re.IGNORECASE):
-            actor["score"] = min(100, actor["score"] + 40)
-            if actor["score"] >= 100:
-                actor["quarantined"] = True
-
-            event = {
-                "client_ip": client_ip,
-                "country": country_badge,
-                "origin": network_origin,
-                "method": method,
-                "path": req_path,
-                "status": "BLOCKED",
-                "score": actor["score"],
-                "reason": "XSS Script Injection Detected"
-            }
-            await broadcast_telemetry(event)
-            return JSONResponse(
-                status_code=403,
-                content={"error": "L7 WAF: Cross-Site Scripting Blocked", "score": actor["score"]}
-            )
-
-    # 5. Rate Limiting Check
-    recent_reqs = [t for t in actor["timestamps"] if now - t < 5.0]
-    if len(recent_reqs) > 15:
+    # Rate Limiting (>15 reqs in 5s)
+    if len([t for t in actor["timestamps"] if now - t < 5.0]) > 15:
         actor["score"] = min(100, actor["score"] + 25)
         if actor["score"] >= 100:
             actor["quarantined"] = True
-
-        event = {
-            "client_ip": client_ip,
-            "country": country_badge,
-            "origin": network_origin,
-            "method": method,
-            "path": req_path,
-            "status": "BLOCKED",
-            "score": actor["score"],
-            "reason": "Rate-Limit Exceeded (DoS Flooding)"
-        }
+            DENYLIST.add(client_ip)
+        actor["reason"] = "Rate-Limit Exceeded (DoS Flooding)"
+        log_event(client_ip, method, req_path, "BLOCKED", actor["score"], "MEDIUM", "DoS Flood", actor["reason"])
+        event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": "MEDIUM", "category": "DoS Flood", "reason": actor["reason"]}
         await broadcast_telemetry(event)
-        return JSONResponse(
-            status_code=429,
-            content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]}
-        )
+        return JSONResponse(status_code=429, content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]})
 
-    # 6. Normal Clean Traffic (Forwarding)
-    event = {
-        "client_ip": client_ip,
-        "country": country_badge,
-        "origin": network_origin,
-        "method": method,
-        "path": req_path,
-        "status": "ALLOWED",
-        "score": actor["score"],
-        "reason": "VERIFIED CLEAN"
-    }
+    # CLEAN LEGITIMATE REQUEST (FORWARDED TO PORT 9000)
+    log_event(client_ip, method, req_path, "ALLOWED", actor["score"], "LOW", "Clean Traffic", "VERIFIED CLEAN")
+    event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "ALLOWED", "score": actor["score"], "severity": "LOW", "category": "Clean Traffic", "reason": "VERIFIED CLEAN"}
     await broadcast_telemetry(event)
+    return await forward_to_backend(request)
 
-    target_backend_url = f"{BACKEND_URL}{request.url.path}"
+async def forward_to_backend(request: Request):
+    target = f"{BACKEND_URL}{request.url.path}"
     if request.url.query:
-        target_backend_url += f"?{request.url.query}"
-
+        target += f"?{request.url.query}"
     try:
         async with httpx.AsyncClient() as client:
-            backend_resp = await client.request(
+            resp = await client.request(
                 method=request.method,
-                url=target_backend_url,
+                url=target,
                 headers=dict(request.headers),
                 content=await request.body(),
                 timeout=5.0
             )
-            return Response(
-                content=backend_resp.content,
-                status_code=backend_resp.status_code,
-                headers=dict(backend_resp.headers)
-            )
+            return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
     except httpx.ConnectError:
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Bad Gateway: Protected backend on port 9000 is not reachable."}
-        )
+        return JSONResponse(status_code=502, content={"error": "Bad Gateway: Upstream backend not reachable."})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
 
-# ==========================================
-# RUN SERVER
-# ==========================================
 if __name__ == "__main__":
     uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)

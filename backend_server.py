@@ -10,6 +10,16 @@ def home():
 def get_user(id: str = "1"):
     return {"status": "success", "user_id": id, "role": "Employee"}
 
+@app.get("/api/balance")
+def get_balance():
+    return {
+        "status": "success",
+        "account_id": "CORP-AEGIS-9921",
+        "allocated_balance": 150000.00,
+        "currency": "INR",
+        "security_clearance": "L4_VALIDATED"
+    }
+
 if __name__ == "__main__":
     import uvicorn
     # Localhost par target server chalega
