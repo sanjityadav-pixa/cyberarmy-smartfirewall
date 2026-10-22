@@ -11,7 +11,8 @@ import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-BACKEND_URL = "https://cyberarmy.it.com"
+# Production Target URL (Vercel Custom Domain with www)
+BACKEND_URL = "https://www.cyberarmy.it.com"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
@@ -334,7 +335,7 @@ async def firewall_middleware(request: Request, call_next):
         await broadcast_telemetry(event)
         return JSONResponse(status_code=429, content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]})
 
-    # CLEAN LEGITIMATE REQUEST (FORWARDED TO PORT 9000)
+    # CLEAN LEGITIMATE REQUEST
     log_event(client_ip, method, req_path, "ALLOWED", actor["score"], "LOW", "Clean Traffic", "VERIFIED CLEAN")
     event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "ALLOWED", "score": actor["score"], "severity": "LOW", "category": "Clean Traffic", "reason": "VERIFIED CLEAN"}
     await broadcast_telemetry(event)
@@ -345,14 +346,14 @@ async def forward_to_backend(request: Request):
     if request.url.query:
         target += f"?{request.url.query}"
     try:
-        # Vercel ko batana padega ki target Host 'cyberarmy.it.com' hai
+        # Vercel custom domain ke liye host www.cyberarmy.it.com bhejna zaroori hai
         forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
-        forward_headers["host"] = "cyberarmy.it.com"
+        forward_headers["host"] = "www.cyberarmy.it.com"
 
         async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
             backend_resp = await client.request(
                 method=request.method,
-                url=target_backend_url,
+                url=target,
                 headers=forward_headers,
                 content=await request.body(),
                 timeout=15.0
@@ -374,8 +375,6 @@ async def forward_to_backend(request: Request):
             status_code=502,
             content={"error": "Bad Gateway: Protected Vercel backend is not reachable."}
         )
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
 
