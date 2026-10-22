@@ -10,8 +10,8 @@ import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-# Upstream Protected Domain
-BACKEND_URL = "https://cyberarmy.it.com"
+# Upstream Direct Vercel Production Domain
+BACKEND_URL = "https://cyberarmy-one.vercel.app"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
@@ -335,13 +335,13 @@ async def firewall_middleware(request: Request, call_next):
 async def forward_to_backend(request: Request):
     req_path = request.url.path
     query_str = f"?{request.url.query}" if request.url.query else ""
-    target_url = f"https://cyberarmy.it.com{req_path}{query_str}"
+    target_url = f"https://cyberarmy-one.vercel.app{req_path}{query_str}"
     
     try:
-        # Host header matching direct custom domain
+        # Vercel direct domain headers
         forward_headers = {
-            "host": "cyberarmy.it.com",
-            "user-agent": request.headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "host": "cyberarmy-one.vercel.app",
+            "user-agent": request.headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
             "accept": request.headers.get("accept", "*/*"),
             "accept-language": request.headers.get("accept-language", "en-US,en;q=0.9"),
         }
@@ -351,7 +351,7 @@ async def forward_to_backend(request: Request):
 
         body = await request.body()
 
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=20.0) as client:
+        async with httpx.AsyncClient(verify=True, follow_redirects=True, timeout=25.0) as client:
             resp = await client.request(
                 method=request.method,
                 url=target_url,
