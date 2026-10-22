@@ -11,7 +11,7 @@ import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-BACKEND_URL = "http://127.0.0.1:9000"
+BACKEND_URL = "https://cyberarmy.it.com"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
