@@ -4,7 +4,7 @@ import sqlite3
 from typing import List, Dict
 from urllib.parse import unquote, unquote_plus
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 import httpx
 import uvicorn
 
@@ -228,115 +228,4 @@ def get_audit_logs():
     cursor.execute("SELECT timestamp, operator, action, target, outcome FROM audit_logs ORDER BY id DESC LIMIT 50")
     logs = cursor.fetchall()
     conn.close()
-    return [{"timestamp": l[0], "operator": l[1], "action": l[2], "target": l[3], "outcome": l[4]} for l in logs]
-
-@app.get("/api/analytics/events")
-def get_analytics_events():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT timestamp, client_ip, method, path, status, score, severity, category, reason, is_demo FROM security_events ORDER BY id DESC LIMIT 100")
-    events = cursor.fetchall()
-    conn.close()
-    return [{"timestamp": e[0], "ip": e[1], "method": e[2], "path": e[3], "status": e[4], "score": e[5], "severity": e[6], "category": e[7], "reason": e[8], "is_demo": bool(e[9])} for e in events]
-
-@app.post("/api/demo/inject")
-async def inject_demo_event(payload: Dict[str, str]):
-    etype = payload.get("type", "SQLI")
-    demo_ip = payload.get("ip", "198.51.100.42")
-    if etype == "SQLI":
-        score, sev, cat, rsn, stat = 85, "CRITICAL", "SQL Injection", "Simulated SQL Injection Attack", "BLOCKED"
-    elif etype == "XSS":
-        score, sev, cat, rsn, stat = 65, "HIGH", "XSS", "Simulated XSS Vector", "BLOCKED"
-    elif etype == "HONEYPOT":
-        score, sev, cat, rsn, stat = 100, "CRITICAL", "Honeypot Decoy", "Simulated Hit on Decoy", "BLOCKED"
-    else:
-        score, sev, cat, rsn, stat = 0, "LOW", "Clean Traffic", "Legitimate Authorized Access", "ALLOWED"
-
-    log_event(demo_ip, "POST" if stat == "BLOCKED" else "GET", "/api/test", stat, score, sev, cat, rsn, is_demo=1)
-    event = {"client_ip": demo_ip, "method": "POST" if stat == "BLOCKED" else "GET", "path": "/api/test", "status": stat, "score": score, "severity": sev, "category": cat, "reason": f"[DEMO] {rsn}", "is_demo": True}
-    await broadcast_telemetry(event)
-    return {"status": "injected", "event": event}
-
-INTERNAL_ENDPOINTS = [
-    "/ws", "/dashboard", "/favicon.ico",
-    "/api/unban", "/api/quarantine", "/api/system/health",
-    "/api/quarantined", "/api/honeypot", "/api/rules",
-    "/api/ip/reputation", "/api/audit/logs", "/api/analytics/events", "/api/demo/inject"
-]
-
-@app.middleware("http")
-async def firewall_middleware(request: Request, call_next):
-    req_path = request.url.path
-    if any(req_path == ep or req_path.startswith(ep + "/") for ep in INTERNAL_ENDPOINTS):
-        return await call_next(request)
-
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    actor = get_actor_state(client_ip)
-    now = time.time()
-    actor["timestamps"].append(now)
-
-    query_str = str(request.url.query)
-    method = request.method
-    raw_string = f"{req_path} {query_str}"
-    test_string = unquote_plus(unquote(raw_string))
-
-    if client_ip in ALLOWLIST:
-        return await forward_to_backend(request)
-
-    if client_ip in DENYLIST or actor["quarantined"] or actor["score"] >= 100:
-        actor["quarantined"] = True
-        log_event(client_ip, method, req_path, "BLOCKED", actor["score"], "CRITICAL", "Quarantine", "Endpoint Quarantined")
-        event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": "CRITICAL", "category": "Quarantine", "reason": "Host Quarantined"}
-        await broadcast_telemetry(event)
-        return JSONResponse(status_code=403, content={"error": "Access Denied: Host Quarantined", "ip": client_ip, "score": actor["score"]})
-
-    for node in HONEYPOT_NODES:
-        if node["status"] == "ACTIVE" and (req_path.lower() == node["path"].lower() or req_path.lower().startswith(node["path"].lower())):
-            node["hits"] += 1
-            actor["score"] = 100
-            actor["quarantined"] = True
-            actor["reason"] = f"Triggered Honeypot: {node['name']}"
-            DENYLIST.add(client_ip)
-            log_event(client_ip, method, req_path, "BLOCKED", 100, "CRITICAL", "Honeypot Trap", actor["reason"])
-            event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": 100, "severity": "CRITICAL", "category": "Honeypot Decoy", "reason": actor["reason"]}
-            await broadcast_telemetry(event)
-            return JSONResponse(status_code=403, content={"error": "Critical Intrusion Detected: Honeypot Triggered", "ip": client_ip, "score": 100})
-
-    for r_id, name, category, severity, pattern, _ in get_active_rules():
-        if re.search(pattern, test_string, re.IGNORECASE):
-            added_score = 45 if severity == "HIGH" else 25
-            actor["score"] = min(100, actor["score"] + added_score)
-            if actor["score"] >= 100:
-                actor["quarantined"] = True
-                DENYLIST.add(client_ip)
-            actor["reason"] = f"Triggered {name}"
-            log_event(client_ip, method, req_path, "BLOCKED", actor["score"], severity, category, actor["reason"])
-            event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": severity, "category": category, "reason": actor["reason"]}
-            await broadcast_telemetry(event)
-            return JSONResponse(status_code=403, content={"error": f"L7 WAF: {name} Intercepted", "score": actor["score"]})
-
-    if len([t for t in actor["timestamps"] if now - t < 5.0]) > 15:
-        actor["score"] = min(100, actor["score"] + 25)
-        if actor["score"] >= 100:
-            actor["quarantined"] = True
-            DENYLIST.add(client_ip)
-        actor["reason"] = "Rate-Limit Exceeded (DoS Flooding)"
-        log_event(client_ip, method, req_path, "BLOCKED", actor["score"], "MEDIUM", "DoS Flood", actor["reason"])
-        event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "BLOCKED", "score": actor["score"], "severity": "MEDIUM", "category": "DoS Flood", "reason": actor["reason"]}
-        await broadcast_telemetry(event)
-        return JSONResponse(status_code=429, content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]})
-
-    log_event(client_ip, method, req_path, "ALLOWED", actor["score"], "LOW", "Clean Traffic", "VERIFIED CLEAN")
-    event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "ALLOWED", "score": actor["score"], "severity": "LOW", "category": "Clean Traffic", "reason": "VERIFIED CLEAN"}
-    await broadcast_telemetry(event)
-    return await forward_to_backend(request)
-
-async def forward_to_backend(request: Request):
-    req_path = request.url.path
-    query_str = f"?{request.url.query}" if request.url.query else ""
-    target_url = f"https://cyberarmy.it.com{req_path}{query_str}"
-    
-    return RedirectResponse(url=target_url, status_code=302)
-
-if __name__ == "__main__":
-    uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)
+    return [{"timestamp": l[0], "operator":
