@@ -334,9 +334,9 @@ async def firewall_middleware(request: Request, call_next):
 async def forward_to_backend(request: Request):
     req_path = request.url.path
     query_str = f"?{request.url.query}" if request.url.query else ""
-    target_url = f"https://www.cyberarmy.it.com{req_path}{query_str}"
+    target_url = f"https://cyberarmy.it.com{req_path}{query_str}"
     
-    return RedirectResponse(url=target_url, status_code=307)
+    return RedirectResponse(url=target_url, status_code=302)
 
 if __name__ == "__main__":
     uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)
