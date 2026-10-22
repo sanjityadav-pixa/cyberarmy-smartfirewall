@@ -345,17 +345,37 @@ async def forward_to_backend(request: Request):
     if request.url.query:
         target += f"?{request.url.query}"
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.request(
+        # Vercel ko batana padega ki target Host 'cyberarmy.it.com' hai
+        forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
+        forward_headers["host"] = "cyberarmy.it.com"
+
+        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+            backend_resp = await client.request(
                 method=request.method,
-                url=target,
-                headers=dict(request.headers),
+                url=target_backend_url,
+                headers=forward_headers,
                 content=await request.body(),
-                timeout=5.0
+                timeout=15.0
             )
-            return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+            
+            # Response headers filter karein taaki compression ya encoding issue na aaye
+            excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection"]
+            response_headers = {
+                k: v for k, v in backend_resp.headers.items() if k.lower() not in excluded_headers
+            }
+
+            return Response(
+                content=backend_resp.content,
+                status_code=backend_resp.status_code,
+                headers=response_headers
+            )
     except httpx.ConnectError:
-        return JSONResponse(status_code=502, content={"error": "Bad Gateway: Upstream backend not reachable."})
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Bad Gateway: Protected Vercel backend is not reachable."}
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
 
