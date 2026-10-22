@@ -11,8 +11,7 @@ import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-# Production Target URL (Vercel Custom Domain with www)
-BACKEND_URL = "https://www.cyberarmy.it.com"
+BACKEND_URL = "https://wwwcyberarmy.it.com"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
@@ -335,48 +334,11 @@ async def firewall_middleware(request: Request, call_next):
         await broadcast_telemetry(event)
         return JSONResponse(status_code=429, content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]})
 
-    # CLEAN LEGITIMATE REQUEST
+    # CLEAN LEGITIMATE REQUEST (FORWARDED TO PORT 9000)
     log_event(client_ip, method, req_path, "ALLOWED", actor["score"], "LOW", "Clean Traffic", "VERIFIED CLEAN")
     event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "ALLOWED", "score": actor["score"], "severity": "LOW", "category": "Clean Traffic", "reason": "VERIFIED CLEAN"}
     await broadcast_telemetry(event)
     return await forward_to_backend(request)
-
-async def forward_to_backend(request: Request):
-    target = f"{BACKEND_URL}{request.url.path}"
-    if request.url.query:
-        target += f"?{request.url.query}"
-    try:
-        # Vercel custom domain ke liye host www.cyberarmy.it.com bhejna zaroori hai
-        forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]}
-        forward_headers["host"] = "www.cyberarmy.it.com"
-
-        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-            backend_resp = await client.request(
-                method=request.method,
-                url=target,
-                headers=forward_headers,
-                content=await request.body(),
-                timeout=15.0
-            )
-            
-            # Response headers filter karein taaki compression ya encoding issue na aaye
-            excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection"]
-            response_headers = {
-                k: v for k, v in backend_resp.headers.items() if k.lower() not in excluded_headers
-            }
-
-            return Response(
-                content=backend_resp.content,
-                status_code=backend_resp.status_code,
-                headers=response_headers
-            )
-    except httpx.ConnectError:
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Bad Gateway: Protected Vercel backend is not reachable."}
-        )
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
 
 if __name__ == "__main__":
     uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)
