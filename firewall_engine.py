@@ -4,14 +4,13 @@ import sqlite3
 from typing import List, Dict
 from urllib.parse import unquote, unquote_plus
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 import httpx
 import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-# Upstream Direct Vercel Production Domain
-BACKEND_URL = "https://cyberarmy-one.vercel.app"
+BACKEND_URL = "https://www.cyberarmy.it.com"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
@@ -335,51 +334,9 @@ async def firewall_middleware(request: Request, call_next):
 async def forward_to_backend(request: Request):
     req_path = request.url.path
     query_str = f"?{request.url.query}" if request.url.query else ""
-    target_url = f"https://cyberarmy-one.vercel.app{req_path}{query_str}"
+    target_url = f"https://www.cyberarmy.it.com{req_path}{query_str}"
     
-    try:
-        # Vercel direct domain headers
-        forward_headers = {
-            "host": "cyberarmy-one.vercel.app",
-            "user-agent": request.headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
-            "accept": request.headers.get("accept", "*/*"),
-            "accept-language": request.headers.get("accept-language", "en-US,en;q=0.9"),
-        }
-
-        if "content-type" in request.headers:
-            forward_headers["content-type"] = request.headers["content-type"]
-
-        body = await request.body()
-
-        async with httpx.AsyncClient(verify=True, follow_redirects=True, timeout=25.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=forward_headers,
-                content=body if body else None
-            )
-
-            excluded_headers = {
-                "content-encoding", "content-length", "transfer-encoding", 
-                "connection", "x-matched-path", "x-vercel-id"
-            }
-            res_headers = {
-                k: v for k, v in resp.headers.items() if k.lower() not in excluded_headers
-            }
-
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=res_headers,
-                media_type=resp.headers.get("content-type")
-            )
-    except httpx.ConnectError:
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Bad Gateway: Protected Vercel backend is not reachable."}
-        )
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
+    return RedirectResponse(url=target_url, status_code=307)
 
 if __name__ == "__main__":
     uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)
