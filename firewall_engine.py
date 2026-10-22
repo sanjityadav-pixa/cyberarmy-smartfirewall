@@ -1,8 +1,7 @@
 import time
 import re
-import json
 import sqlite3
-from typing import List, Dict, Optional
+from typing import List, Dict
 from urllib.parse import unquote, unquote_plus
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -11,7 +10,8 @@ import uvicorn
 
 app = FastAPI(title="AEGIS Zero-Trust WAF & SOC Platform")
 
-BACKEND_URL = "https://wwwcyberarmy.it.com"
+# Upstream Protected Domain
+BACKEND_URL = "https://cyberarmy.it.com"
 DB_FILE = "aegis_soc.db"
 START_TIME = time.time()
 
@@ -131,7 +131,6 @@ async def serve_dashboard():
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error loading index.html: {str(e)}</h3>", status_code=500)
 
-# INTERNAL API ROUTES
 @app.post("/api/unban")
 def unban_ip(payload: Dict[str, str]):
     ip = payload.get("ip")
@@ -259,7 +258,6 @@ async def inject_demo_event(payload: Dict[str, str]):
     await broadcast_telemetry(event)
     return {"status": "injected", "event": event}
 
-# WAF REVERSE PROXY MIDDLEWARE
 INTERNAL_ENDPOINTS = [
     "/ws", "/dashboard", "/favicon.ico",
     "/api/unban", "/api/quarantine", "/api/system/health",
@@ -283,11 +281,9 @@ async def firewall_middleware(request: Request, call_next):
     raw_string = f"{req_path} {query_str}"
     test_string = unquote_plus(unquote(raw_string))
 
-    # Allowlist check
     if client_ip in ALLOWLIST:
         return await forward_to_backend(request)
 
-    # Quarantined Check
     if client_ip in DENYLIST or actor["quarantined"] or actor["score"] >= 100:
         actor["quarantined"] = True
         log_event(client_ip, method, req_path, "BLOCKED", actor["score"], "CRITICAL", "Quarantine", "Endpoint Quarantined")
@@ -295,7 +291,6 @@ async def firewall_middleware(request: Request, call_next):
         await broadcast_telemetry(event)
         return JSONResponse(status_code=403, content={"error": "Access Denied: Host Quarantined", "ip": client_ip, "score": actor["score"]})
 
-    # Honeypot Check
     for node in HONEYPOT_NODES:
         if node["status"] == "ACTIVE" and (req_path.lower() == node["path"].lower() or req_path.lower().startswith(node["path"].lower())):
             node["hits"] += 1
@@ -308,7 +303,6 @@ async def firewall_middleware(request: Request, call_next):
             await broadcast_telemetry(event)
             return JSONResponse(status_code=403, content={"error": "Critical Intrusion Detected: Honeypot Triggered", "ip": client_ip, "score": 100})
 
-    # L7 Rules Inspection
     for r_id, name, category, severity, pattern, _ in get_active_rules():
         if re.search(pattern, test_string, re.IGNORECASE):
             added_score = 45 if severity == "HIGH" else 25
@@ -322,7 +316,6 @@ async def firewall_middleware(request: Request, call_next):
             await broadcast_telemetry(event)
             return JSONResponse(status_code=403, content={"error": f"L7 WAF: {name} Intercepted", "score": actor["score"]})
 
-    # Rate Limiting (>15 reqs in 5s)
     if len([t for t in actor["timestamps"] if now - t < 5.0]) > 15:
         actor["score"] = min(100, actor["score"] + 25)
         if actor["score"] >= 100:
@@ -334,11 +327,59 @@ async def firewall_middleware(request: Request, call_next):
         await broadcast_telemetry(event)
         return JSONResponse(status_code=429, content={"error": "Rate Limit Exceeded: Slow down", "score": actor["score"]})
 
-    # CLEAN LEGITIMATE REQUEST (FORWARDED TO PORT 9000)
     log_event(client_ip, method, req_path, "ALLOWED", actor["score"], "LOW", "Clean Traffic", "VERIFIED CLEAN")
     event = {"client_ip": client_ip, "method": method, "path": req_path, "status": "ALLOWED", "score": actor["score"], "severity": "LOW", "category": "Clean Traffic", "reason": "VERIFIED CLEAN"}
     await broadcast_telemetry(event)
     return await forward_to_backend(request)
+
+async def forward_to_backend(request: Request):
+    req_path = request.url.path
+    query_str = f"?{request.url.query}" if request.url.query else ""
+    target_url = f"https://cyberarmy.it.com{req_path}{query_str}"
+    
+    try:
+        # Host header matching direct custom domain
+        forward_headers = {
+            "host": "cyberarmy.it.com",
+            "user-agent": request.headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "accept": request.headers.get("accept", "*/*"),
+            "accept-language": request.headers.get("accept-language", "en-US,en;q=0.9"),
+        }
+
+        if "content-type" in request.headers:
+            forward_headers["content-type"] = request.headers["content-type"]
+
+        body = await request.body()
+
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=20.0) as client:
+            resp = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=body if body else None
+            )
+
+            excluded_headers = {
+                "content-encoding", "content-length", "transfer-encoding", 
+                "connection", "x-matched-path", "x-vercel-id"
+            }
+            res_headers = {
+                k: v for k, v in resp.headers.items() if k.lower() not in excluded_headers
+            }
+
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=res_headers,
+                media_type=resp.headers.get("content-type")
+            )
+    except httpx.ConnectError:
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Bad Gateway: Protected Vercel backend is not reachable."}
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
 
 if __name__ == "__main__":
     uvicorn.run("firewall_engine:app", host="0.0.0.0", port=8080, reload=False)
